@@ -1,0 +1,14 @@
+[mist]
+base_url = https://api.eu.mist.com/api/v1
+# A single API token for a user with access to the source org and every
+# destination org listed below.
+api_token = YOUR_API_TOKEN
+
+[source]
+org_id = YOUR_SOURCE_ORG_ID
+
+[destinations]
+# One or more candidate destination org IDs, comma-separated (or one per
+# indented line). If more than one is listed, you'll be prompted at runtime
+# to pick which one licenses should be moved to/from.
+org_ids = YOUR_DEST_ORG_ID_1, YOUR_DEST_ORG_ID_2
