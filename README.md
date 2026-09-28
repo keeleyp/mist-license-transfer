@@ -96,6 +96,38 @@ Picking a **LICENSE** row moves capacity out of the source org.
 Picking an **AMENDMENT** row reverses a previous move, returning that
 capacity to the source org.
 
+## Running Behind a TLS-Inspecting Proxy (e.g. Zscaler)
+
+If your network intercepts and re-signs HTTPS traffic, plain TLS verification
+against the Mist API will fail with a certificate error. Add a `[network]`
+section to `mist_license_transfer.ini`:
+
+```ini
+[network]
+ca_bundle = /path/to/zscaler-root-ca.pem
+```
+
+`ca_bundle` should point to a PEM file with your proxy's root CA certificate
+(or a bundle that includes it) — your IT team or the proxy client app can
+usually export this. Everything else in `[network]` is optional:
+
+```ini
+[network]
+ca_bundle =
+verify_ssl = true
+http_proxy =
+https_proxy =
+```
+
+- `verify_ssl = false` disables certificate verification entirely — only use
+  this if you truly have no way to get the proxy's CA certificate.
+- `http_proxy` / `https_proxy` are only needed if the standard `HTTP_PROXY`
+  / `HTTPS_PROXY` / `NO_PROXY` environment variables aren't already set for
+  your environment; `requests` picks those up automatically otherwise.
+
+With no `[network]` section at all, nothing changes — the tool behaves
+exactly as it does on a normal, non-intercepted connection.
+
 ## Options
 
 | Flag | Purpose |

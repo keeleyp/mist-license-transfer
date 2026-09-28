@@ -102,29 +102,97 @@ def load_config(path: Path) -> dict:
     if not dest_org_ids:
         raise TransferError("[destinations] org_ids must list at least one destination org ID.")
 
+    verify, proxies = _parse_network_settings(parser)
+
     return {
         "base_url": parser["mist"]["base_url"].rstrip("/"),
         "api_token": parser["mist"]["api_token"].strip(),
         "source_org_id": parser["source"]["org_id"].strip(),
         "dest_org_ids": dest_org_ids,
+        "verify": verify,
+        "proxies": proxies,
     }
+
+
+def _parse_network_settings(parser: configparser.ConfigParser):
+    """Reads the optional [network] section used to work behind a TLS-inspecting
+    proxy (e.g. Zscaler). Every setting here is optional - with no [network]
+    section at all, behaviour is unchanged (system CA store, env-var proxies)."""
+    if "network" not in parser:
+        return True, {}
+
+    section = parser["network"]
+
+    ca_bundle = section.get("ca_bundle", "").strip()
+    verify_ssl = section.getboolean("verify_ssl", fallback=True)
+
+    if ca_bundle:
+        ca_path = Path(ca_bundle).expanduser()
+        if not ca_path.is_file():
+            raise TransferError(
+                f"[network] ca_bundle does not exist: {ca_path}\n"
+                f"This should be a PEM file containing your proxy's root CA "
+                f"certificate (e.g. exported from Zscaler)."
+            )
+        verify = str(ca_path)
+    elif not verify_ssl:
+        verify = False
+    else:
+        verify = True
+
+    proxies = {}
+    http_proxy = section.get("http_proxy", "").strip()
+    https_proxy = section.get("https_proxy", "").strip()
+    if http_proxy:
+        proxies["http"] = http_proxy
+    if https_proxy:
+        proxies["https"] = https_proxy
+
+    return verify, proxies
 
 
 # --------------------------------------------------------------------------
 # API helpers
 # --------------------------------------------------------------------------
 
-def api_request(method: str, url: str, token: str, **kwargs):
-    """Wraps requests.request with consistent error handling. Returns parsed JSON."""
-    headers = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
-    try:
-        response = requests.request(
-            method, url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs
+def build_session(cfg: dict) -> requests.Session:
+    """Builds the shared HTTP session, wired up for a TLS-inspecting proxy
+    (e.g. Zscaler) when [network] settings are present in the config."""
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Token {cfg['api_token']}",
+        "Content-Type": "application/json",
+    })
+    session.verify = cfg["verify"]
+    if cfg["proxies"]:
+        session.proxies.update(cfg["proxies"])
+
+    if cfg["verify"] is False:
+        warn(
+            "TLS certificate verification is DISABLED ([network] verify_ssl = false). "
+            "Traffic to the Mist API will not be authenticated - only use this as a last resort."
         )
+        requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+    return session
+
+
+def api_request(session: requests.Session, method: str, url: str, **kwargs):
+    """Wraps session.request with consistent error handling. Returns parsed JSON."""
+    try:
+        response = session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
         response.raise_for_status()
         if not response.content:
             return {}
         return response.json()
+    except requests.exceptions.SSLError as e:
+        raise TransferError(
+            f"TLS certificate verification failed for {url}: {e}\n"
+            f"If you're behind a TLS-inspecting proxy (e.g. Zscaler), set [network] ca_bundle "
+            f"in your config to the path of its root CA certificate (PEM format)."
+        )
+    except requests.exceptions.ProxyError as e:
+        raise TransferError(f"Could not reach the proxy for {url}: {e}\nCheck [network] http_proxy/https_proxy in your config.")
     except requests.exceptions.Timeout:
         raise TransferError(f"Request to {url} timed out after {REQUEST_TIMEOUT}s.")
     except requests.exceptions.ConnectionError:
@@ -149,23 +217,23 @@ def _extract_error_detail(response) -> str:
         return f"\n{text}" if text else ""
 
 
-def get_org_name(base_url: str, org_id: str, token: str) -> str:
+def get_org_name(session: requests.Session, base_url: str, org_id: str) -> str:
     try:
-        data = api_request("GET", f"{base_url}/orgs/{org_id}", token)
+        data = api_request(session, "GET", f"{base_url}/orgs/{org_id}")
         return data.get("name", "Unknown")
     except TransferError as e:
         warn(f"Could not fetch organisation name for {org_id}: {e}")
         return "Unknown"
 
 
-def select_destination_org(base_url: str, token: str, dest_org_ids: list) -> tuple:
+def select_destination_org(session: requests.Session, base_url: str, dest_org_ids: list) -> tuple:
     """Resolves the destination org to use. Prompts the user when more than one is configured."""
     if len(dest_org_ids) == 1:
         org_id = dest_org_ids[0]
-        return org_id, get_org_name(base_url, org_id, token)
+        return org_id, get_org_name(session, base_url, org_id)
 
     info("\nMultiple destination orgs configured - fetching org names...")
-    orgs = [(org_id, get_org_name(base_url, org_id, token)) for org_id in dest_org_ids]
+    orgs = [(org_id, get_org_name(session, base_url, org_id)) for org_id in dest_org_ids]
 
     print(f"\n{Ansi.BOLD}Available Destination Organizations:{Ansi.RESET}")
     for i, (org_id, name) in enumerate(orgs, 1):
@@ -327,7 +395,7 @@ def confirm(prompt: str) -> bool:
 # Actions
 # --------------------------------------------------------------------------
 
-def move_license(cfg: dict, source_org_name: str, dest_org_id: str, dest_org_name: str, license_item: dict, dry_run: bool):
+def move_license(cfg: dict, session: requests.Session, source_org_name: str, dest_org_id: str, dest_org_name: str, license_item: dict, dry_run: bool):
     max_quantity = license_item["quantity"]
     quantity = prompt_quantity(max_quantity)
 
@@ -354,8 +422,8 @@ def move_license(cfg: dict, source_org_name: str, dest_org_id: str, dest_org_nam
         "quantity": quantity,
     }
     api_request(
-        "PUT", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses",
-        cfg["api_token"], json=payload,
+        session, "PUT", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses",
+        json=payload,
     )
 
     success(f"Successfully moved {quantity} units of {license_item['subscription_id']}")
@@ -372,7 +440,7 @@ def move_license(cfg: dict, source_org_name: str, dest_org_id: str, dest_org_nam
     print(f"Note: please verify the subscription appears in {dest_org_name}.")
 
 
-def return_amendment(cfg: dict, source_org_name: str, amendment_item: dict, dry_run: bool):
+def return_amendment(cfg: dict, session: requests.Session, source_org_name: str, amendment_item: dict, dry_run: bool):
     print(f"\nYou selected an amendment (move record) for subscription {amendment_item['subscription_id']}.")
     print(f"This will return {abs(amendment_item['quantity'])} licenses from the destination org back to {source_org_name}.")
     print(f"Amendment ID:     {amendment_item['amendment_id']}")
@@ -389,8 +457,8 @@ def return_amendment(cfg: dict, source_org_name: str, amendment_item: dict, dry_
     info("\nInitiating license return...")
     payload = {"op": "unamend", "amendment_id": amendment_item["amendment_id"]}
     api_request(
-        "PUT", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses",
-        cfg["api_token"], json=payload,
+        session, "PUT", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses",
+        json=payload,
     )
 
     success(f"Successfully returned {abs(amendment_item['quantity'])} units of {amendment_item['subscription_id']}")
@@ -427,14 +495,15 @@ def main():
 
     cfg = load_config(args.config)
     multi_dest = len(cfg["dest_org_ids"]) > 1
+    session = build_session(cfg)
 
     info("Fetching organization details...")
-    source_org_name = get_org_name(cfg["base_url"], cfg["source_org_id"], cfg["api_token"])
+    source_org_name = get_org_name(session, cfg["base_url"], cfg["source_org_id"])
     print(f"\nSource Organization:")
     print(f"  Name: {source_org_name}")
     print(f"  ID:   {cfg['source_org_id']}")
 
-    dest_org_id, dest_org_name = select_destination_org(cfg["base_url"], cfg["api_token"], cfg["dest_org_ids"])
+    dest_org_id, dest_org_name = select_destination_org(session, cfg["base_url"], cfg["dest_org_ids"])
 
     while True:
         print(f"\nDestination Organization:")
@@ -443,7 +512,7 @@ def main():
 
         print(f"\nFetching licenses from source organization: {source_org_name}")
         licenses_data = api_request(
-            "GET", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses", cfg["api_token"]
+            session, "GET", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses"
         )
 
         if not licenses_data:
@@ -459,9 +528,9 @@ def main():
                 item_type, item = prompt_selection(items)
 
                 if item_type == "license":
-                    move_license(cfg, source_org_name, dest_org_id, dest_org_name, item, args.dry_run)
+                    move_license(cfg, session, source_org_name, dest_org_id, dest_org_name, item, args.dry_run)
                 else:
-                    return_amendment(cfg, source_org_name, item, args.dry_run)
+                    return_amendment(cfg, session, source_org_name, item, args.dry_run)
 
         if multi_dest:
             next_action = prompt_menu("What would you like to do next?", [
@@ -478,7 +547,7 @@ def main():
         if next_action == "quit":
             break
         if next_action == "change":
-            dest_org_id, dest_org_name = select_destination_org(cfg["base_url"], cfg["api_token"], cfg["dest_org_ids"])
+            dest_org_id, dest_org_name = select_destination_org(session, cfg["base_url"], cfg["dest_org_ids"])
 
     print("\nScript completed.")
 
