@@ -248,26 +248,56 @@ def select_destination_org(session: requests.Session, base_url: str, dest_org_id
 # --------------------------------------------------------------------------
 
 def collect_valid_licenses(licenses_data: dict) -> list:
+    """Active subscriptions that still have capacity left in the source org.
+
+    `quantity` is the original subscription size; Mist reports what's left after
+    earlier moves out as `remaining_quantity` (quantity + the negative amendments
+    for that subscription). Older responses without that field fall back to
+    computing it from the amendments list."""
     now = datetime.now().timestamp()
+
+    moved_out = {}
+    for amend in licenses_data.get("amendments", []):
+        qty = amend.get("quantity", 0)
+        if qty < 0:
+            sub_id = amend.get("subscription_id")
+            moved_out[sub_id] = moved_out.get(sub_id, 0) + qty
+
     result = []
     for lic in licenses_data.get("licenses", []):
         start = lic.get("start_time", 0)
         end = lic.get("end_time", 0)
-        if start <= now <= end and lic.get("subscription_id"):
-            result.append({
-                "subscription_id": lic.get("subscription_id"),
-                "type": lic.get("type", "unknown"),
-                "quantity": lic.get("quantity", 0),
-                "start_time": start,
-                "end_time": end,
-            })
+        sub_id = lic.get("subscription_id")
+        if not (start <= now <= end and sub_id):
+            continue
+        quantity = lic.get("quantity", 0)
+        remaining = lic.get("remaining_quantity")
+        if remaining is None:
+            remaining = quantity + moved_out.get(sub_id, 0)
+        if remaining <= 0:
+            continue
+        result.append({
+            "subscription_id": sub_id,
+            "type": lic.get("type", "unknown"),
+            "quantity": quantity,
+            "remaining": remaining,
+            "start_time": start,
+            "end_time": end,
+        })
     return result
 
 
-def collect_returnable_amendments(licenses_data: dict, dest_org_id: str) -> list:
+def collect_returnable_amendments(licenses_data: dict) -> list:
+    """Moves out of the source org (negative amendments) to any destination org
+    that haven't expired - each can be reversed with an unamend."""
+    now = datetime.now().timestamp()
     result = []
     for amend in licenses_data.get("amendments", []):
-        if amend.get("quantity", 0) < 0 and amend.get("dst_org_id") == dest_org_id:
+        if (
+            amend.get("quantity", 0) < 0
+            and amend.get("dst_org_id")
+            and amend.get("end_time", 0) >= now
+        ):
             result.append({
                 "amendment_id": amend.get("id"),
                 "subscription_id": amend.get("subscription_id"),
@@ -293,14 +323,14 @@ def fmt_date(ts) -> str:
 # Display / selection
 # --------------------------------------------------------------------------
 
-def display_items(source_org_name: str, dest_org_name: str, licenses: list, amendments: list) -> list:
-    width = 132
+def display_items(source_org_name: str, dest_org_name: str, licenses: list, amendments: list, org_names: dict) -> list:
+    width = 142
     print("\n" + "=" * width)
     print(f"VALID SUBSCRIPTIONS AND AMENDMENTS IN SOURCE ORGANIZATION: {source_org_name}")
     print("=" * width)
     header = (
         f"{'#':<3} {'Type':<10} {'Subscription ID':<18} {'Sub Type':<12} "
-        f"{'Quantity':<8} {'Start Date':<12} {'End Date':<12} {'Status':<12} {'Dest Org':<36}"
+        f"{'Total':<7} {'Avail':<7} {'Start Date':<12} {'End Date':<12} {'Status':<12} {'Dest Org':<36}"
     )
     print(header)
     print("-" * width)
@@ -310,27 +340,42 @@ def display_items(source_org_name: str, dest_org_name: str, licenses: list, amen
     for lic in licenses:
         print(
             f"{idx:<3} {'LICENSE':<10} {lic['subscription_id']:<18} {lic['type']:<12} "
-            f"{lic['quantity']:<8} {fmt_date(lic['start_time']):<12} {fmt_date(lic['end_time']):<12} "
-            f"{'Active':<12} {'-':<36}"
+            f"{lic['quantity']:<7} {lic['remaining']:<7} {fmt_date(lic['start_time']):<12} "
+            f"{fmt_date(lic['end_time']):<12} {'Active':<12} {'-':<36}"
         )
         items.append(("license", lic))
         idx += 1
 
     for amend in amendments:
+        dest_label = org_names.get(amend["dst_org_id"]) or amend["dst_org_id"]
         print(
             f"{idx:<3} {'AMENDMENT':<10} {amend['subscription_id']:<18} {amend['type']:<12} "
-            f"{amend['quantity']:<8} {fmt_date(amend['start_time']):<12} {fmt_date(amend['end_time']):<12} "
-            f"{'Moved Out':<12} {amend['dst_org_id']:<36}"
+            f"{amend['quantity']:<7} {'-':<7} {fmt_date(amend['start_time']):<12} "
+            f"{fmt_date(amend['end_time']):<12} {'Moved Out':<12} {dest_label:<36}"
         )
         items.append(("amendment", amend))
         idx += 1
 
     print("-" * width)
     print(
-        f"{Ansi.DIM}Legend: LICENSE = Available to move out | "
-        f"AMENDMENT = Previously moved out to {dest_org_name} (can be returned){Ansi.RESET}"
+        f"{Ansi.DIM}Legend: LICENSE = Available to move out to {dest_org_name} (Avail = units still in the source org) | "
+        f"AMENDMENT = Previously moved out to the Dest Org shown (can be returned){Ansi.RESET}"
     )
     return items
+
+
+def resolve_org_names(session: requests.Session, base_url: str, org_ids, cache: dict) -> dict:
+    """Fills `cache` with org names for any IDs not already in it. Orgs the token
+    can't read are cached as None (shown by ID) without a warning, since
+    amendments can point at orgs outside the configured destinations."""
+    for org_id in org_ids:
+        if org_id in cache:
+            continue
+        try:
+            cache[org_id] = api_request(session, "GET", f"{base_url}/orgs/{org_id}").get("name")
+        except TransferError:
+            cache[org_id] = None
+    return cache
 
 
 def prompt_index(count: int, prompt: str) -> int:
@@ -396,13 +441,13 @@ def confirm(prompt: str) -> bool:
 # --------------------------------------------------------------------------
 
 def move_license(cfg: dict, session: requests.Session, source_org_name: str, dest_org_id: str, dest_org_name: str, license_item: dict, dry_run: bool):
-    max_quantity = license_item["quantity"]
+    max_quantity = license_item["remaining"]
     quantity = prompt_quantity(max_quantity)
 
     print(f"\n{Ansi.BOLD}Confirm Transfer:{Ansi.RESET}")
     print(f"Subscription ID: {license_item['subscription_id']}")
     print(f"Type:            {license_item['type']}")
-    print(f"Quantity:        {quantity}")
+    print(f"Quantity:        {quantity} (of {max_quantity} available, {license_item['quantity']} total)")
     print(f"From:            {source_org_name} ({cfg['source_org_id']})")
     print(f"To:              {dest_org_name} ({dest_org_id})")
 
@@ -440,11 +485,13 @@ def move_license(cfg: dict, session: requests.Session, source_org_name: str, des
     print(f"Note: please verify the subscription appears in {dest_org_name}.")
 
 
-def return_amendment(cfg: dict, session: requests.Session, source_org_name: str, amendment_item: dict, dry_run: bool):
+def return_amendment(cfg: dict, session: requests.Session, source_org_name: str, amendment_item: dict, org_names: dict, dry_run: bool):
+    dst_id = amendment_item["dst_org_id"]
+    dst_label = f"{org_names[dst_id]} ({dst_id})" if org_names.get(dst_id) else dst_id
     print(f"\nYou selected an amendment (move record) for subscription {amendment_item['subscription_id']}.")
     print(f"This will return {abs(amendment_item['quantity'])} licenses from the destination org back to {source_org_name}.")
     print(f"Amendment ID:     {amendment_item['amendment_id']}")
-    print(f"Destination Org:  {amendment_item['dst_org_id']}")
+    print(f"Destination Org:  {dst_label}")
 
     if not confirm("\nProceed with return (unamend)? (y/N): "):
         info("Return cancelled.")
@@ -462,7 +509,7 @@ def return_amendment(cfg: dict, session: requests.Session, source_org_name: str,
     )
 
     success(f"Successfully returned {abs(amendment_item['quantity'])} units of {amendment_item['subscription_id']}")
-    print(f"From:    Destination org ({amendment_item['dst_org_id']})")
+    print(f"From:    {dst_label}")
     print(f"Back to: {source_org_name} ({cfg['source_org_id']})")
     success("\nReturn (unamend) operation completed successfully!")
     print(f"Note: please verify the subscription is back in {source_org_name}.")
@@ -475,14 +522,58 @@ def return_amendment(cfg: dict, session: requests.Session, source_org_name: str,
 def parse_args():
     parser = argparse.ArgumentParser(description="Move or return Mist subscription licenses between two orgs.")
     parser.add_argument(
-        "-c", "--config", type=Path, default=DEFAULT_CONFIG_PATH,
-        help=f"Path to config .ini file (default: {DEFAULT_CONFIG_PATH.name})",
+        "-c", "--config", type=Path, default=None,
+        help=(
+            "Path to config .ini file. If omitted, the .ini files in the script's folder "
+            "and the current folder are listed for you to pick from (or used directly if "
+            f"there's only one; default {DEFAULT_CONFIG_PATH.name})."
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Show what would happen without calling the Mist API to make changes.",
     )
     return parser.parse_args()
+
+
+def find_config_files() -> list:
+    """All .ini files in the script's folder and the current folder (the
+    .ini.example template doesn't match *.ini), de-duplicated, sorted by name."""
+    seen = {}
+    for folder in (DEFAULT_CONFIG_PATH.parent, Path.cwd()):
+        for path in folder.glob("*.ini"):
+            seen.setdefault(path.resolve(), path)
+    return sorted(seen.values(), key=lambda p: (p.name.lower(), str(p)))
+
+
+def _describe_config(path: Path) -> str:
+    """Short label for the picker: the source org ID from the file, if readable."""
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path)
+        org_id = parser.get("source", "org_id", fallback="").strip()
+    except configparser.Error:
+        return "(unreadable)"
+    return f"source org {org_id}" if org_id else "(no [source] org_id)"
+
+
+def choose_config_path(explicit) -> Path:
+    if explicit is not None:
+        return explicit
+
+    candidates = find_config_files()
+    if not candidates:
+        return DEFAULT_CONFIG_PATH  # load_config explains how to create it
+    if len(candidates) == 1:
+        return candidates[0]
+
+    script_dir = DEFAULT_CONFIG_PATH.parent.resolve()
+    print(f"\n{Ansi.BOLD}Available Config Files:{Ansi.RESET}")
+    for i, path in enumerate(candidates, 1):
+        shown = path.name if path.resolve().parent == script_dir else str(path)
+        print(f"{i:<3} {shown:<40} {Ansi.DIM}{_describe_config(path)}{Ansi.RESET}")
+    idx = prompt_index(len(candidates), f"\nSelect config file (1-{len(candidates)}) or 'q' to quit: ")
+    return candidates[idx]
 
 
 def main():
@@ -493,7 +584,9 @@ def main():
     if args.dry_run:
         warn("Running in --dry-run mode: no changes will be made.\n")
 
-    cfg = load_config(args.config)
+    config_path = choose_config_path(args.config)
+    info(f"Using config: {config_path}")
+    cfg = load_config(config_path)
     multi_dest = len(cfg["dest_org_ids"]) > 1
     session = build_session(cfg)
 
@@ -504,6 +597,7 @@ def main():
     print(f"  ID:   {cfg['source_org_id']}")
 
     dest_org_id, dest_org_name = select_destination_org(session, cfg["base_url"], cfg["dest_org_ids"])
+    org_names = {cfg["source_org_id"]: source_org_name, dest_org_id: dest_org_name}
 
     while True:
         print(f"\nDestination Organization:")
@@ -515,22 +609,29 @@ def main():
             session, "GET", f"{cfg['base_url']}/orgs/{cfg['source_org_id']}/licenses"
         )
 
-        if not licenses_data:
-            warn("No license data found.")
-        else:
-            valid_licenses = collect_valid_licenses(licenses_data)
-            valid_amendments = collect_returnable_amendments(licenses_data, dest_org_id)
+        valid_licenses = collect_valid_licenses(licenses_data or {})
+        valid_amendments = collect_returnable_amendments(licenses_data or {})
 
-            if not valid_licenses and not valid_amendments:
-                warn(f"No valid subscriptions or amendments available for {dest_org_name}.")
+        # Nothing in the listing depends on the chosen destination, so if there's
+        # nothing to move or return there's nothing another loop could do either.
+        if not valid_licenses and not valid_amendments:
+            if not licenses_data:
+                warn(f"No license data returned for {source_org_name}.")
             else:
-                items = display_items(source_org_name, dest_org_name, valid_licenses, valid_amendments)
-                item_type, item = prompt_selection(items)
+                warn(
+                    f"Nothing to do: {source_org_name} has no active subscriptions with "
+                    f"units left to move, and no previous moves out to return."
+                )
+            break
 
-                if item_type == "license":
-                    move_license(cfg, session, source_org_name, dest_org_id, dest_org_name, item, args.dry_run)
-                else:
-                    return_amendment(cfg, session, source_org_name, item, args.dry_run)
+        resolve_org_names(session, cfg["base_url"], {a["dst_org_id"] for a in valid_amendments}, org_names)
+        items = display_items(source_org_name, dest_org_name, valid_licenses, valid_amendments, org_names)
+        item_type, item = prompt_selection(items)
+
+        if item_type == "license":
+            move_license(cfg, session, source_org_name, dest_org_id, dest_org_name, item, args.dry_run)
+        else:
+            return_amendment(cfg, session, source_org_name, item, org_names, args.dry_run)
 
         if multi_dest:
             next_action = prompt_menu("What would you like to do next?", [
@@ -548,6 +649,7 @@ def main():
             break
         if next_action == "change":
             dest_org_id, dest_org_name = select_destination_org(session, cfg["base_url"], cfg["dest_org_ids"])
+            org_names[dest_org_id] = dest_org_name
 
     print("\nScript completed.")
 

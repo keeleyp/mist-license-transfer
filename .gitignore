@@ -1,4 +1,5 @@
-mist_license_transfer.ini
+*.ini
+!*.ini.example
 __pycache__/
 *.pyc
 .venv/

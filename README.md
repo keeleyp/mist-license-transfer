@@ -68,17 +68,17 @@ Destination Organization:
 
 Fetching licenses from source organization: Acme HQ
 
-#   Type       Subscription ID    Sub Type   Quantity ...
-1   LICENSE    SUB-0101678        WAN        16       ...
-2   LICENSE    SUB-0094572        MAN        1329     ...
-3   AMENDMENT  SUB-0363543        MAN        -6       ...   (previously moved out)
+#   Type       Subscription ID    Sub Type   Total   Avail   ...  Status      Dest Org
+1   LICENSE    SUB-0101678        WAN        16      16      ...  Active      -
+2   LICENSE    SUB-0094572        MAN        1329    1323    ...  Active      -
+3   AMENDMENT  SUB-0094572        MAN        -6      -       ...  Moved Out   Acme Branch Offices
 
 Select item to move/return (1-3) or 'q' to quit: 1
 Enter quantity to move (max 16, or 'q' to cancel): 5
 
 Confirm Transfer:
 Subscription ID: SUB-0101678
-Quantity:        5
+Quantity:        5 (of 16 available, 16 total)
 From:            Acme HQ
 To:              Acme Branch Offices
 
@@ -92,9 +92,16 @@ What would you like to do next?
 Select an option (1-3):
 ```
 
-Picking a **LICENSE** row moves capacity out of the source org.
+Picking a **LICENSE** row moves capacity out of the source org to the chosen
+destination. **Total** is the subscription's full size and **Avail** is what's
+still in the source org after earlier moves out — you can only move up to
+Avail, and subscriptions with nothing left aren't listed.
+
 Picking an **AMENDMENT** row reverses a previous move, returning that
-capacity to the source org.
+capacity to the source org. Every unexpired move out of the source org is
+listed, whichever org it went to (shown in **Dest Org**), so you don't need
+to switch destination to undo one. If there's nothing to move or return,
+the tool says so and exits.
 
 ## Running Behind a TLS-Inspecting Proxy (e.g. Zscaler)
 
@@ -133,12 +140,34 @@ exactly as it does on a normal, non-intercepted connection.
 | Flag | Purpose |
 |---|---|
 | `--dry-run` | Walk through the whole workflow, but skip the actual API call that makes a change — useful for a trial run |
-| `--config <path>` | Use a config file other than `mist_license_transfer.ini` (e.g. for a different pair of orgs) |
+| `--config <path>` | Use a specific config file, skipping the picker below |
 
 ```bash
 python3 mist_license_transfer.py --dry-run
 python3 mist_license_transfer.py --config other-orgs.ini
 ```
+
+## Using Several Config Files
+
+You can keep one `.ini` per set of orgs (e.g. `customer-a.ini`,
+`customer-b.ini`), each copied from `mist_license_transfer.ini.example`. When
+you run the tool without `--config`, it looks for `.ini` files in the
+script's folder and in your current folder:
+
+- **one file** — it's used automatically
+- **several** — you're shown a numbered list (with each file's source org ID)
+  and asked which to use
+
+```
+Available Config Files:
+1   customer-a.ini                           source org 79017ec2-...
+2   customer-b.ini                           source org fd15b80b-...
+
+Select config file (1-2) or 'q' to quit:
+```
+
+All `*.ini` files are gitignored (only the `.example` template is tracked),
+so tokens in any of them stay out of version control.
 
 ## A Couple of Notes
 
