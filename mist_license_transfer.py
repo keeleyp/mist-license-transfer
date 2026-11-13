@@ -104,7 +104,16 @@ def load_config(path: Path) -> dict:
 
     verify, proxies = _parse_network_settings(parser)
 
+    # Undocumented on purpose (not in the README or .ini.example): moves out to
+    # orgs this API token can't read are listed for information only, unless
+    # `allow_unknown_org_returns = true` is added to the [mist] section.
+    try:
+        allow_unknown = parser["mist"].getboolean("allow_unknown_org_returns", fallback=False)
+    except ValueError:
+        raise TransferError("[mist] allow_unknown_org_returns must be true or false.")
+
     return {
+        "allow_unknown_org_returns": allow_unknown,
         "base_url": parser["mist"]["base_url"].rstrip("/"),
         "api_token": parser["mist"]["api_token"].strip(),
         "source_org_id": parser["source"]["org_id"].strip(),
@@ -226,6 +235,30 @@ def get_org_name(session: requests.Session, base_url: str, org_id: str) -> str:
         return "Unknown"
 
 
+def get_source_org_name(session: requests.Session, base_url: str, org_id: str, config_path: Path) -> str:
+    """Unlike destinations, the source org must be readable - every listing and
+    change goes through it - so fail straight away with a clear reason."""
+    try:
+        data = api_request(session, "GET", f"{base_url}/orgs/{org_id}")
+    except TransferError as e:
+        first_line = str(e).splitlines()[0]
+        if "HTTP 401" in first_line:
+            raise TransferError(
+                f"The API token in {config_path.name} was rejected as invalid.\n"
+                f"  ({first_line})\n"
+                f"It may have been deleted or expired - create a new one in Mist and update [mist] api_token."
+            )
+        if "HTTP 403" in first_line or "HTTP 404" in first_line:
+            raise TransferError(
+                f"The API token in {config_path.name} can't access the source org {org_id}.\n"
+                f"  ({first_line})\n"
+                f"Check that [source] org_id is correct, and that the account behind the token "
+                f"has a role on that org (directly, or through an MSP the org belongs to)."
+            )
+        raise
+    return data.get("name") or "Unknown"
+
+
 def select_destination_org(session: requests.Session, base_url: str, dest_org_ids: list) -> tuple:
     """Resolves the destination org to use. Prompts the user when more than one is configured."""
     if len(dest_org_ids) == 1:
@@ -248,7 +281,8 @@ def select_destination_org(session: requests.Session, base_url: str, dest_org_id
 # --------------------------------------------------------------------------
 
 def collect_valid_licenses(licenses_data: dict) -> list:
-    """Active subscriptions that still have capacity left in the source org.
+    """Unexpired subscriptions (active now, or starting in the future) that still
+    have capacity left in the source org. Expired ones are skipped.
 
     `quantity` is the original subscription size; Mist reports what's left after
     earlier moves out as `remaining_quantity` (quantity + the negative amendments
@@ -268,7 +302,7 @@ def collect_valid_licenses(licenses_data: dict) -> list:
         start = lic.get("start_time", 0)
         end = lic.get("end_time", 0)
         sub_id = lic.get("subscription_id")
-        if not (start <= now <= end and sub_id):
+        if not sub_id or end < now:
             continue
         quantity = lic.get("quantity", 0)
         remaining = lic.get("remaining_quantity")
@@ -283,6 +317,7 @@ def collect_valid_licenses(licenses_data: dict) -> list:
             "remaining": remaining,
             "start_time": start,
             "end_time": end,
+            "status": "Active" if start <= now else "Not Started",
         })
     return result
 
@@ -323,7 +358,11 @@ def fmt_date(ts) -> str:
 # Display / selection
 # --------------------------------------------------------------------------
 
-def display_items(source_org_name: str, dest_org_name: str, licenses: list, amendments: list, org_names: dict) -> list:
+def display_items(source_org_name: str, dest_org_name: str, licenses: list, amendments: list,
+                  org_names: dict, unknown_amendments: list = (), allow_unknown: bool = False) -> list:
+    """Prints the table and returns the selectable items in display order.
+    `unknown_amendments` (moves to orgs the token can't read) go last; they're
+    numbered and selectable only when `allow_unknown` is set."""
     width = 142
     print("\n" + "=" * width)
     print(f"VALID SUBSCRIPTIONS AND AMENDMENTS IN SOURCE ORGANIZATION: {source_org_name}")
@@ -341,7 +380,7 @@ def display_items(source_org_name: str, dest_org_name: str, licenses: list, amen
         print(
             f"{idx:<3} {'LICENSE':<10} {lic['subscription_id']:<18} {lic['type']:<12} "
             f"{lic['quantity']:<7} {lic['remaining']:<7} {fmt_date(lic['start_time']):<12} "
-            f"{fmt_date(lic['end_time']):<12} {'Active':<12} {'-':<36}"
+            f"{fmt_date(lic['end_time']):<12} {lic['status']:<12} {'-':<36}"
         )
         items.append(("license", lic))
         idx += 1
@@ -355,6 +394,26 @@ def display_items(source_org_name: str, dest_org_name: str, licenses: list, amen
         )
         items.append(("amendment", amend))
         idx += 1
+
+    if unknown_amendments:
+        print("-" * width)
+        if allow_unknown:
+            print(f"{Ansi.YELLOW}Moved out to orgs this API token can't access:{Ansi.RESET}")
+        else:
+            print(f"{Ansi.DIM}Moved out to orgs this API token can't access (shown for information - can't be returned here):{Ansi.RESET}")
+        for amend in unknown_amendments:
+            label = f"{idx:<3}" if allow_unknown else f"{'-':<3}"
+            line = (
+                f"{label} {'AMENDMENT':<10} {amend['subscription_id']:<18} {amend['type']:<12} "
+                f"{amend['quantity']:<7} {'-':<7} {fmt_date(amend['start_time']):<12} "
+                f"{fmt_date(amend['end_time']):<12} {'Unknown Org':<12} {amend['dst_org_id']:<36}"
+            )
+            if allow_unknown:
+                print(line)
+                items.append(("amendment", amend))
+                idx += 1
+            else:
+                print(f"{Ansi.DIM}{line}{Ansi.RESET}")
 
     print("-" * width)
     print(
@@ -492,6 +551,8 @@ def return_amendment(cfg: dict, session: requests.Session, source_org_name: str,
     print(f"This will return {abs(amendment_item['quantity'])} licenses from the destination org back to {source_org_name}.")
     print(f"Amendment ID:     {amendment_item['amendment_id']}")
     print(f"Destination Org:  {dst_label}")
+    if not org_names.get(dst_id):
+        warn("Warning: this API token can't access that org, so its name and current usage of these licenses can't be checked.")
 
     if not confirm("\nProceed with return (unamend)? (y/N): "):
         info("Return cancelled.")
@@ -591,7 +652,7 @@ def main():
     session = build_session(cfg)
 
     info("Fetching organization details...")
-    source_org_name = get_org_name(session, cfg["base_url"], cfg["source_org_id"])
+    source_org_name = get_source_org_name(session, cfg["base_url"], cfg["source_org_id"], config_path)
     print(f"\nSource Organization:")
     print(f"  Name: {source_org_name}")
     print(f"  ID:   {cfg['source_org_id']}")
@@ -619,13 +680,24 @@ def main():
                 warn(f"No license data returned for {source_org_name}.")
             else:
                 warn(
-                    f"Nothing to do: {source_org_name} has no active subscriptions with "
+                    f"Nothing to do: {source_org_name} has no unexpired subscriptions with "
                     f"units left to move, and no previous moves out to return."
                 )
             break
 
         resolve_org_names(session, cfg["base_url"], {a["dst_org_id"] for a in valid_amendments}, org_names)
-        items = display_items(source_org_name, dest_org_name, valid_licenses, valid_amendments, org_names)
+        known_amendments = [a for a in valid_amendments if org_names.get(a["dst_org_id"])]
+        unknown_amendments = [a for a in valid_amendments if not org_names.get(a["dst_org_id"])]
+        items = display_items(
+            source_org_name, dest_org_name, valid_licenses, known_amendments, org_names,
+            unknown_amendments, cfg["allow_unknown_org_returns"],
+        )
+        if not items:
+            warn(
+                f"\nNothing to do: the only moves to return went to orgs this API token "
+                f"can't access, and {source_org_name} has no units left to move."
+            )
+            break
         item_type, item = prompt_selection(items)
 
         if item_type == "license":

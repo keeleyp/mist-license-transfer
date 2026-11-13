@@ -95,7 +95,9 @@ Select an option (1-3):
 Picking a **LICENSE** row moves capacity out of the source org to the chosen
 destination. **Total** is the subscription's full size and **Avail** is what's
 still in the source org after earlier moves out — you can only move up to
-Avail, and subscriptions with nothing left aren't listed.
+Avail, and subscriptions with nothing left aren't listed. Subscriptions that
+haven't started yet are included (Status **Not Started**) so future capacity
+can be moved ahead of time; expired subscriptions are left out.
 
 Picking an **AMENDMENT** row reverses a previous move, returning that
 capacity to the source org. Every unexpired move out of the source org is
